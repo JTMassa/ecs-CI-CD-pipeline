@@ -156,6 +156,63 @@ resource "aws_iam_role_policy_attachment" "ecs_execution_role_policy" {
   role       = aws_iam_role.ecs_execution_role.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
+
+# GitHub Actions OIDC role for publishing images to ECR
+resource "aws_iam_openid_connect_provider" "github" {
+  url             = "https://token.actions.githubusercontent.com"
+  client_id_list  = ["sts.amazonaws.com"]
+  thumbprint_list = ["6938fd4d98bab03faadb97b34396831e3780aea1"]
+}
+
+resource "aws_iam_role" "github_actions" {
+  name = "nginx-github-actions"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRoleWithWebIdentity"
+      Effect = "Allow"
+      Principal = {
+        Federated = aws_iam_openid_connect_provider.github.arn
+      }
+      Condition = {
+        StringEquals = {
+          "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+        }
+        StringLike = {
+          "token.actions.githubusercontent.com:sub" = "repo:JTMassa/ecs-CI-CD-pipeline:ref:refs/heads/main"
+        }
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "github_actions_ecr" {
+  name = "nginx-github-actions-ecr"
+  role = aws_iam_role.github_actions.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "ecr:GetAuthorizationToken",
+        "ecr:CompleteLayerUpload",
+        "ecr:UploadLayerPart",
+        "ecr:InitiateLayerUpload",
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:PutImage"
+      ]
+      Resource = "*"
+    }]
+  })
+}
+
+output "github_actions_role_arn" {
+  description = "IAM role ARN to store in the GitHub AWS_ROLE_ARN secret"
+  value       = aws_iam_role.github_actions.arn
+}
+
 resource "aws_appautoscaling_target" "ecs_target" {
   max_capacity       = 6
   min_capacity       = 2
