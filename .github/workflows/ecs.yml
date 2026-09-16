@@ -1,4 +1,9 @@
 name: Build and scan and push Docker image to Amazon ECR
+
+permissions:
+  id-token: write
+  contents: read
+
 on:
     push:
         branches:
