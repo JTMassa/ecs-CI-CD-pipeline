@@ -75,7 +75,7 @@ jobs:
 
     
   deploy:
-    needs: build
+    needs: scan
     runs-on: ubuntu-latest
    
 
