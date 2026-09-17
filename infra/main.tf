@@ -1,27 +1,77 @@
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
 provider "aws" {
   region = "us-east-1"
 }
-# 1. Default VPC and Subnets
-data "aws_vpc" "default" {
-  default = true
+
+############################
+# VPC + Subnets + IGW
+############################
+
+resource "aws_vpc" "main" {
+  cidr_block = "10.0.0.0/16"
 }
-data "aws_subnets" "default" {
-  filter {
-    name   = "vpc-id"
-    values = [data.aws_vpc.default.id]
-  }
+
+resource "aws_subnet" "public_a" {
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = "10.0.1.0/24"
+  availability_zone       = "us-east-1a"
+  map_public_ip_on_launch = true
 }
-# 2. Security Groups
-resource "aws_security_group" "alb_sg" {
-  name        = "nginx-alb-sg"
-  description = "Allow HTTP inbound to ALB"
-  vpc_id      = data.aws_vpc.default.id
+
+resource "aws_subnet" "public_b" {
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = "10.0.2.0/24"
+  availability_zone       = "us-east-1b"
+  map_public_ip_on_launch = true
+}
+
+resource "aws_internet_gateway" "igw" {
+  vpc_id = aws_vpc.main.id
+}
+
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+}
+
+resource "aws_route" "default" {
+  route_table_id         = aws_route_table.public.id
+  destination_cidr_block = "0.0.0.0/0"
+  gateway_id             = aws_internet_gateway.igw.id
+}
+
+resource "aws_route_table_association" "public_a" {
+  subnet_id      = aws_subnet.public_a.id
+  route_table_id = aws_route_table.public.id
+}
+
+resource "aws_route_table_association" "public_b" {
+  subnet_id      = aws_subnet.public_b.id
+  route_table_id = aws_route_table.public.id
+}
+
+############################
+# Security Group
+############################
+
+resource "aws_security_group" "ecs_sg" {
+  name   = "ecs-sg"
+  vpc_id = aws_vpc.main.id
+
   ingress {
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
+
   egress {
     from_port   = 0
     to_port     = 0
@@ -29,214 +79,119 @@ resource "aws_security_group" "alb_sg" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 }
-resource "aws_security_group" "ecs_tasks_sg" {
-  name        = "nginx-ecs-tasks-sg"
-  description = "Allow inbound traffic from ALB only"
-  vpc_id      = data.aws_vpc.default.id
-  ingress {
-    from_port       = 80
-    to_port         = 80
-    protocol        = "tcp"
-    security_groups = [aws_security_group.alb_sg.id]
-  }
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-}
-# 3. Application Load Balancer & Target Group
-resource "aws_lb" "main" {
-  name               = "nginx-ecs-alb"
-  internal           = false
-  load_balancer_type = "application"
-  security_groups    = [aws_security_group.alb_sg.id]
-  subnets            = data.aws_subnets.default.ids
-}
-resource "aws_lb_target_group" "app" {
-  name        = "nginx-ecs-tg"
-  port        = 80
-  protocol    = "HTTP"
-  vpc_id      = data.aws_vpc.default.id
-  target_type = "ip"
-  health_check {
-    path                = "/"
-    healthy_threshold   = 2
-    unhealthy_threshold = 10
-    timeout             = 5
-    interval            = 30
-    matcher             = "200"
-  }
-}
-resource "aws_lb_listener" "front_end" {
-  load_balancer_arn = aws_lb.main.arn
-  port              = "80"
-  protocol          = "HTTP"
-  default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.app.arn
-  }
-}
-# 4. ECS Cluster, Task Definition, and Service
+
+############################
+# ECS Cluster + Task Role
+############################
+
 resource "aws_ecs_cluster" "main" {
   name = "nginx-cluster"
 }
-resource "aws_cloudwatch_log_group" "ecs" {
-  name              = "/ecs/nginx-app"
-  retention_in_days = 1
+
+resource "aws_iam_role" "ecs_task_role" {
+  name = "ecsTaskExecutionRole"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Effect    = "Allow",
+      Principal = { Service = "ecs-tasks.amazonaws.com" },
+      Action    = "sts:AssumeRole"
+    }]
+  })
 }
-resource "aws_ecs_task_definition" "app" {
-  family                   = "nginx-app"
-  network_mode             = "awsvpc"
+
+resource "aws_iam_role_policy_attachment" "ecs_task_policy" {
+  role       = aws_iam_role.ecs_task_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+############################
+# Task Definition (NGINX)
+############################
+
+resource "aws_ecs_task_definition" "nginx" {
+  family                   = "nginx-task"
   requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
   cpu                      = "256"
   memory                   = "512"
-  execution_role_arn       = aws_iam_role.ecs_execution_role.arn
+  execution_role_arn       = aws_iam_role.ecs_task_role.arn
+
   container_definitions = jsonencode([
     {
       name      = "nginx"
       image     = "nginx:latest"
       essential = true
-      portMappings = [
-        {
-          containerPort = 80
-          hostPort      = 80
-        }
-      ]
-      logConfiguration = {
-        logDriver = "awslogs"
-        options = {
-          "awslogs-group"         = aws_cloudwatch_log_group.ecs.name
-          "awslogs-region"        = "us-east-1"
-          "awslogs-stream-prefix" = "ecs"
-        }
-      }
+      portMappings = [{
+        containerPort = 80
+        hostPort      = 80
+      }]
     }
   ])
 }
-resource "aws_ecs_service" "main" {
+
+############################
+# Load Balancer + TG + Listener
+############################
+
+resource "aws_lb" "alb" {
+  name               = "ecs-nginx-alb"
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.ecs_sg.id]
+  subnets            = [aws_subnet.public_a.id, aws_subnet.public_b.id]
+}
+
+resource "aws_lb_target_group" "tg" {
+  name        = "ecs-nginx-tg"
+  port        = 80
+  protocol    = "HTTP"
+  vpc_id      = aws_vpc.main.id
+  target_type = "ip"
+}
+
+resource "aws_lb_listener" "listener" {
+  load_balancer_arn = aws_lb.alb.arn
+  port              = 80
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.tg.arn
+  }
+}
+
+############################
+# ECS Service (2 tasks)
+############################
+
+resource "aws_ecs_service" "service" {
   name            = "nginx-service"
   cluster         = aws_ecs_cluster.main.id
-  task_definition = aws_ecs_task_definition.app.arn
+  task_definition = aws_ecs_task_definition.nginx.arn
   desired_count   = 2
   launch_type     = "FARGATE"
+
   network_configuration {
-    security_groups  = [aws_security_group.ecs_tasks_sg.id]
-    subnets          = data.aws_subnets.default.ids
-    assign_public_ip = true
-  }
+  subnets         = [aws_subnet.public_a.id, aws_subnet.public_b.id]
+  security_groups = [aws_security_group.ecs_sg.id]
+  assign_public_ip = true
+}
+
+
   load_balancer {
-    target_group_arn = aws_lb_target_group.app.arn
+    target_group_arn = aws_lb_target_group.tg.arn
     container_name   = "nginx"
     container_port   = 80
   }
-  depends_on = [aws_lb_listener.front_end]
-  lifecycle {
-    ignore_changes = [desired_count]
-  }
-}
-# 5. IAM Roles for ECS Fargate
-resource "aws_iam_role" "ecs_execution_role" {
-  name = "nginx_ecs_execution_role"
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "ecs-tasks.amazonaws.com"
-        }
-      }
-    ]
-  })
-}
-resource "aws_iam_role_policy_attachment" "ecs_execution_role_policy" {
-  role       = aws_iam_role.ecs_execution_role.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+
+  depends_on = [aws_lb_listener.listener]
 }
 
-# GitHub Actions OIDC role for publishing images to ECR
-resource "aws_iam_openid_connect_provider" "github" {
-  url             = "https://token.actions.githubusercontent.com"
-  client_id_list  = ["sts.amazonaws.com"]
-  thumbprint_list = ["6938fd4d98bab03faadb97b34396831e3780aea1"]
-}
+############################
+# Output
+############################
 
-resource "aws_iam_role" "github_actions" {
-  name = "nginx-github-actions"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Action = "sts:AssumeRoleWithWebIdentity"
-      Effect = "Allow"
-      Principal = {
-        Federated = aws_iam_openid_connect_provider.github.arn
-      }
-      Condition = {
-        StringEquals = {
-          "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
-        }
-        StringLike = {
-          "token.actions.githubusercontent.com:sub" = "repo:JTMassa/ecs-CI-CD-pipeline:ref:refs/heads/main"
-        }
-      }
-    }]
-  })
-}
-
-resource "aws_iam_role_policy" "github_actions_ecr" {
-  name = "nginx-github-actions-ecr"
-  role = aws_iam_role.github_actions.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect = "Allow"
-      Action = [
-        "ecr:GetAuthorizationToken",
-        "ecr:CompleteLayerUpload",
-        "ecr:UploadLayerPart",
-        "ecr:InitiateLayerUpload",
-        "ecr:BatchCheckLayerAvailability",
-        "ecr:PutImage"
-      ]
-      Resource = "*"
-    }]
-  })
-}
-
-output "github_actions_role_arn" {
-  description = "IAM role ARN to store in the GitHub AWS_ROLE_ARN secret"
-  value       = aws_iam_role.github_actions.arn
-}
-
-resource "aws_appautoscaling_target" "ecs_target" {
-  max_capacity       = 6
-  min_capacity       = 2
-  resource_id        = "service/${aws_ecs_cluster.main.name}/${aws_ecs_service.main.name}"
-  scalable_dimension = "ecs:service:DesiredCount"
-  service_namespace  = "ecs"
-}
-resource "aws_appautoscaling_policy" "ecs_policy_cpu" {
-  name               = "cpu-auto-scaling"
-  policy_type        = "TargetTrackingScaling"
-  resource_id        = aws_appautoscaling_target.ecs_target.resource_id
-  scalable_dimension = aws_appautoscaling_target.ecs_target.scalable_dimension
-  service_namespace  = aws_appautoscaling_target.ecs_target.service_namespace
-  target_tracking_scaling_policy_configuration {
-    predefined_metric_specification {
-      predefined_metric_type = "ECSServiceAverageCPUUtilization"
-    }
-    target_value       = 75.0
-    scale_in_cooldown  = 300
-    scale_out_cooldown = 60
-  }
-}
-# 7. Output
-output "alb_dns_name" {
-  description = "The DNS name of the application load balancer"
-  value       = aws_lb.main.dns_name
+output "alb_dns" {
+  value = aws_lb.alb.dns_name
 }
